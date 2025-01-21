@@ -3,6 +3,7 @@ import boto3
 import argparse
 import time
 import sys
+import json
 
 def get_instance_details(ec2_client, instance_id):
     """Retrieve instance details including state, VPC, interfaces, and attached SGs."""
@@ -29,6 +30,19 @@ def modify_security_groups(ec2_client, network_interface_id, security_groups):
         Groups=security_groups
     )
 
+def create_backup_tag(ec2_client, instance_id, interfaces):
+    """Create a tag on the instance to backup original security groups."""
+    sg_backup = {"NetworkInterfaces": interfaces}
+    tag_value = json.dumps(sg_backup)
+
+    ec2_client.create_tags(
+        Resources=[instance_id],
+        Tags=[
+            {"Key": "Original_SG_Backup", "Value": tag_value}
+        ]
+    )
+    print(f"Backup tag 'Original_SG_Backup' created for instance {instance_id}.")
+
 def main():
     parser = argparse.ArgumentParser(description="Modify Security Groups attached to an AWS instance.")
     parser.add_argument("--instance-id", required=True, help="The ID of the AWS instance.")
@@ -52,6 +66,9 @@ def main():
         for interface in interfaces:
             print(f"  Interface: {interface['NetworkInterfaceId']}")
             print(f"  Attached SGs: {interface['SecurityGroups']}")
+
+        # Create a backup tag before making any changes
+        create_backup_tag(ec2_client, instance_id, interfaces)
 
         # Find the interface with the given SG
         target_interface = None

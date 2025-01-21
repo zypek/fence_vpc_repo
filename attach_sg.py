@@ -3,7 +3,7 @@
 import boto3
 import argparse
 import sys
-import time
+import json
 
 def get_instance_details(ec2_client, instance_id):
     """Retrieve instance details including state, VPC, interfaces, and attached SGs."""
@@ -23,6 +23,15 @@ def get_instance_details(ec2_client, instance_id):
 
     return instance_state, vpc_id, interfaces
 
+def get_instance_tag(ec2_client, instance_id, tag_key):
+    """Retrieve a specific tag from the instance."""
+    response = ec2_client.describe_instances(InstanceIds=[instance_id])
+    tags = response['Reservations'][0]['Instances'][0].get('Tags', [])
+    for tag in tags:
+        if tag['Key'] == tag_key:
+            return tag['Value']
+    return None
+
 def modify_security_groups(ec2_client, network_interface_id, security_groups):
     """Modify the security groups attached to a specific network interface."""
     ec2_client.modify_network_interface_attribute(
@@ -30,59 +39,93 @@ def modify_security_groups(ec2_client, network_interface_id, security_groups):
         Groups=security_groups
     )
 
+def remove_instance_tag(ec2_client, instance_id, tag_key):
+    """Remove a specific tag from the instance."""
+    ec2_client.delete_tags(
+        Resources=[instance_id],
+        Tags=[
+            {"Key": tag_key}
+        ]
+    )
+    print(f"Tag '{tag_key}' successfully removed from instance {instance_id}.")
+
 def main():
-    parser = argparse.ArgumentParser(description="Attach a Security Group to a specific AWS EC2 interface.")
+    parser = argparse.ArgumentParser(description="Update Security Groups on AWS EC2 interfaces based on tags.")
     parser.add_argument("--instance-id", required=True, help="The ID of the AWS instance.")
-    parser.add_argument("--sg", required=True, help="The Security Group to attach.")
-    parser.add_argument("--interface-id", required=True, help="The network interface to modify.")
     args = parser.parse_args()
 
     instance_id = args.instance_id
-    sg_to_attach = args.sg
-    target_interface_id = args.interface_id
+    tag_key = "Original_SG_Backup"
 
     try:
         # Initialize EC2 client
         ec2_client = boto3.client('ec2')
 
-        # Fetch instance details
-        print(f"Querying details for instance: {instance_id}")
-        instance_state, vpc_id, interfaces = get_instance_details(ec2_client, instance_id)
+        # Fetch the tag
+        print(f"Checking for tag '{tag_key}' on instance {instance_id}...")
+        tag_value = get_instance_tag(ec2_client, instance_id, tag_key)
 
-        print(f"Instance State: {instance_state}")
-        print(f"Instance VPC ID: {vpc_id}")
-        print("Network Interfaces and Attached Security Groups:")
-        for interface in interfaces:
-            print(f"  Interface: {interface['NetworkInterfaceId']}")
-            print(f"  Attached SGs: {interface['SecurityGroups']}")
-
-        # Find the target interface
-        target_interface = next((iface for iface in interfaces if iface['NetworkInterfaceId'] == target_interface_id), None)
-
-        if not target_interface:
-            print(f"Interface {target_interface_id} not found for instance {instance_id}.")
-            sys.exit(1)
-
-        # Check if the SG is already attached
-        current_sgs = target_interface['SecurityGroups']
-        if sg_to_attach in current_sgs:
-            print(f"Security Group {sg_to_attach} is already attached to interface {target_interface_id}.")
+        if not tag_value:
+            print(f"No tag '{tag_key}' found on instance {instance_id}. Exiting.")
             sys.exit(0)
 
-        # Add the SG to the list and update the interface
-        updated_sgs = current_sgs + [sg_to_attach]
-        print(f"Updating interface {target_interface_id} with Security Groups: {updated_sgs}")
-        modify_security_groups(ec2_client, target_interface_id, updated_sgs)
+        # Parse the tag value
+        tag_data = json.loads(tag_value)
+        interfaces_from_tag = tag_data.get("NetworkInterfaces", [])
 
-        # Wait for the changes to propagate
-        time.sleep(5)
+        if not interfaces_from_tag:
+            print(f"Tag '{tag_key}' exists but contains no interfaces or SGs. Exiting.")
+            sys.exit(1)
 
-        # Confirm the change
-        updated_interface = ec2_client.describe_network_interfaces(NetworkInterfaceIds=[target_interface_id])['NetworkInterfaces'][0]
-        print("Updated Security Groups:")
-        print([sg['GroupId'] for sg in updated_interface['Groups']])
+        # Fetch current instance details
+        print(f"Fetching current details for instance {instance_id}...")
+        instance_state, vpc_id, current_interfaces = get_instance_details(ec2_client, instance_id)
 
-        print(f"Successfully attached {sg_to_attach} to interface {target_interface_id}.")
+        all_sgs_updated = True  # Flag to track if all updates are successful
+
+        for interface_from_tag in interfaces_from_tag:
+            tag_interface_id = interface_from_tag["NetworkInterfaceId"]
+            tag_sgs = set(interface_from_tag["SecurityGroups"])
+
+            # Find the matching current interface
+            current_interface = next(
+                (iface for iface in current_interfaces if iface["NetworkInterfaceId"] == tag_interface_id), None
+            )
+
+            if not current_interface:
+                print(f"Interface {tag_interface_id} not found in current instance configuration. Skipping.")
+                all_sgs_updated = False
+                continue
+
+            current_sgs = set(current_interface["SecurityGroups"])
+
+            if current_sgs == tag_sgs:
+                print(f"Interface {tag_interface_id} already has the correct SGs. No action needed.")
+                continue
+
+            # Update SGs by expanding with SGs from the tag
+            updated_sgs = list(current_sgs.union(tag_sgs))
+            print(f"Updating interface {tag_interface_id} with new SGs: {updated_sgs}")
+            modify_security_groups(ec2_client, tag_interface_id, updated_sgs)
+
+            # Fetch updated SGs to confirm
+            updated_interface = ec2_client.describe_network_interfaces(
+                NetworkInterfaceIds=[tag_interface_id]
+            )['NetworkInterfaces'][0]
+            updated_sgs_confirmed = [sg['GroupId'] for sg in updated_interface['Groups']]
+
+            # Compare the confirmed SGs with the expected updated SGs
+            if set(updated_sgs_confirmed) != set(updated_sgs):
+                print(f"Failed to confirm updated SGs for interface {tag_interface_id}. Expected: {updated_sgs}, Found: {updated_sgs_confirmed}")
+                all_sgs_updated = False
+            else:
+                print(f"Successfully confirmed updated SGs for interface {tag_interface_id}: {updated_sgs_confirmed}")
+
+        if all_sgs_updated:
+            print(f"All interfaces have been successfully updated. Removing tag '{tag_key}'...")
+            remove_instance_tag(ec2_client, instance_id, tag_key)
+        else:
+            print(f"Some interfaces were not updated successfully. Retaining tag '{tag_key}' for debugging.")
 
     except Exception as e:
         print(f"An error occurred: {e}")
