@@ -27,7 +27,7 @@ This project provides a set of Python scripts to manage AWS EC2 instances and th
 1. Ensure Python 3 is installed on your system.
 2. Install the required Python package:
    ```bash
-   pip install boto3
+   pip3 install boto3
    ```
 3. Configure AWS credentials for boto3 by setting up your AWS CLI or using environment variables.
 
@@ -35,12 +35,12 @@ This project provides a set of Python scripts to manage AWS EC2 instances and th
 
 ### Script 1: Manage EC2 Power State
 
-**File**: `manage_power.py`
+**File**: `power_state.py`
 
 Run the script to start, stop, or reboot an EC2 instance.
 
 ```bash
-./manage_power.py --instance-id <INSTANCE_ID> --state <on|off> [--off-action <stop|reboot>]
+./power_state.py --instance-id <INSTANCE_ID> --state <on|off> [--off-action <stop|reboot>]
 ```
 
 #### Arguments
@@ -52,7 +52,7 @@ Run the script to start, stop, or reboot an EC2 instance.
 
 To stop an EC2 instance:
 ```bash
-./manage_power.py --instance-id i-0abcd1234efgh5678 --state off --off-action stop
+./power_state.py --instance-id i-0abcd1234efgh5678 --state off --off-action stop
 ```
 
 ### Script 2: Attach a Security Group
@@ -119,8 +119,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact
 
-- **Name**: Your Name
-- **Email**: your.email@example.com
-- **GitHub**: [username](https://github.com/username)
+- **Name**: Sebastian Baszczyj
+- **Email**: sbaszczyj@gmail.com
+- **GitHub**: [zypek](https://github.com/username)
 
 
