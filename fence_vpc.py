@@ -79,6 +79,15 @@ def define_new_opts():
         "required": "0",
         "order": 6,
     }
+    all_opt["invert-sg-removal"] = {
+        "getopt": "",
+        "longopt": "invert-sg-removal",
+        "help": "--invert-sg-removal              Remove all security groups except the specified one.",
+        "shortdesc": "Remove all security groups except specified..",
+        "required": "0",
+        "order": 7,
+    }
+
 
 
 # Retrieve instance ID for self-check
@@ -120,6 +129,25 @@ def get_instance_details(ec2_client, instance_id):
 
     return instance_state, vpc_id, interfaces
 
+# Check if we are the self-fencing node 
+
+def get_self_power_status(conn, instance_id):
+	try:
+		instance = conn.instances.filter(Filters=[{"Name": "instance-id", "Values": [instance_id]}])
+		state = list(instance)[0].state["Name"]
+		if state == "running":
+			logger.debug("Captured my (%s) state and it %s - returning OK - Proceeding with fencing",instance_id,state.upper())
+			return "ok"
+		else:
+			logger.debug("Captured my (%s) state it is %s - returning Alert - Unable to fence other nodes",instance_id,state.upper())
+			return "alert"
+	
+	except ClientError:
+		fail_usage("Failed: Incorrect Access Key or Secret Key.")
+	except EndpointConnectionError:
+		fail_usage("Failed: Incorrect Region.")
+	except IndexError:
+		return "fail"
 
 # Create a backup tag
 def create_backup_tag(ec2_client, instance_id, interfaces):
@@ -150,6 +178,8 @@ def remove_security_groups(ec2_client, instance_id, sg_list):
         original_sgs = interface["SecurityGroups"]
         # Exclude any SGs that are in sg_list
         updated_sgs = [sg for sg in original_sgs if sg not in sg_list]
+
+        #print(sg_list)
 
         # If there's no change or we'd end up with zero SGs, skip
         if updated_sgs == original_sgs:
@@ -182,6 +212,66 @@ def remove_security_groups(ec2_client, instance_id, sg_list):
     # Wait a bit for changes to propagate
     time.sleep(5)
 
+def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list):
+    """
+    Removes all security groups from each network interface except for the specified one.
+    If the specified security group is not attached to an interface, that interface is skipped.
+    
+    Args:
+        ec2_client: The boto3 EC2 client
+        instance_id: The ID of the EC2 instance
+        sg_to_keep_list: List containing the ID of the security group to keep
+    """
+    state, _, interfaces = get_instance_details(ec2_client, instance_id)
+
+    # Create a backup tag before making changes
+    create_backup_tag(ec2_client, instance_id, interfaces)
+
+    changed_any = False
+    for interface in interfaces:
+        original_sgs = interface["SecurityGroups"]
+        
+        # Skip if the security group to keep isn't attached to this interface
+
+        #str(list1).replace('[','').replace(']','')
+        #if sg_to_keep not in original_sgs:
+        # Check if any of the security groups to keep are attached
+        sgs_to_keep = [sg for sg in original_sgs if sg in sg_to_keep_list]
+        if not sgs_to_keep:
+            print(
+                f"Skipping interface {interface['NetworkInterfaceId']}: "
+                f"none of the security groups {sg_to_keep_list} are attached."
+            )
+            continue
+
+        # Set interface to only use the specified security groups
+        updated_sgs = sgs_to_keep
+        
+        if updated_sgs == original_sgs:
+            continue
+
+        print(
+            f"Updating interface {interface['NetworkInterfaceId']} from {original_sgs} "
+            f"to {updated_sgs} (keeping only {sg_to_keep_list})"
+        )
+        ec2_client.modify_network_interface_attribute(
+            NetworkInterfaceId=interface["NetworkInterfaceId"],
+            Groups=updated_sgs
+        )
+        changed_any = True
+
+    # If we didn't modify anything, the specified SG wasn't found on any interface
+    if not changed_any:
+        print(
+            f"Security Groups {sg_to_keep_list} not found on any interface. "
+            f"No changes made."
+        )
+        sys.exit(1)
+
+    # Wait a bit for changes to propagate
+    time.sleep(5)
+
+
 
 # Shutdown instance
 def shutdown_instance(ec2_client, instance_id):
@@ -207,10 +297,13 @@ def fence_vpc_action(conn, options):
     # Now that longopt = "sg", the fence library populates options["--sg"].
     sg_to_remove = options.get("--sg", "").split(",") if options.get("--sg") else []
 
-    # Perform self-check
-    self_instance_id = get_instance_id()
-    if self_instance_id == instance_id:
-        fail_usage("Self-fencing detected. Exiting.")
+    # Perform self-check if skip-race not set
+    #if "--skip-race-check" in options or get_self_power_status(conn,my_instance) == "ok":
+    
+    if "--skip-race-check" not in options:
+        self_instance_id = get_instance_id()
+        if self_instance_id == instance_id:
+            fail_usage("Self-fencing detected. Exiting.")
 
     # Verify the instance is running
     instance_state, _, _ = get_instance_details(ec2_client, instance_id)
@@ -219,9 +312,12 @@ def fence_vpc_action(conn, options):
 
     # Remove security groups (if provided) and shutdown the instance
     if sg_to_remove:
-        remove_security_groups(ec2_client, instance_id, sg_to_remove)
+        if "--invert-sg-removal" not in options:
+            remove_security_groups(ec2_client, instance_id, sg_to_remove)
+        else:
+            keep_only_security_groups(ec2_client, instance_id, sg_to_remove)
 
-    shutdown_instance(ec2_client, instance_id)
+        #shutdown_instance(ec2_client, instance_id)
 
 
 # Main function
@@ -234,7 +330,10 @@ def main():
         "sg",
         "plug",
         "skip_race_check",
+        "invert-sg-removal"
     ]
+
+
     define_new_opts()
 
     # Parse and validate options
@@ -272,8 +371,8 @@ def main():
 
     # Perform the fencing action
     fence_vpc_action(conn, options)
+  
 
 
 if __name__ == "__main__":
     main()
-
