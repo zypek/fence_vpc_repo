@@ -10,6 +10,7 @@ from requests.exceptions import HTTPError
 from botocore.exceptions import ClientError, EndpointConnectionError, NoRegionError
 
 sys.path.append("/usr/share/fence")
+#sys.path.append("/Users/robertbrodie/Documents/GitHub/fence-agents/lib")
 from fencing import (
     all_opt,
     check_input,
