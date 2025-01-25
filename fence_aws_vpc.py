@@ -4,6 +4,7 @@ import sys
 import json
 import boto3
 import requests
+from requests import HTTPError
 import logging
 import time  # Ensure we can call time.sleep
 from requests.exceptions import HTTPError
@@ -11,6 +12,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError, NoRegionEr
 
 #sys.path.append("/usr/share/fence")
 sys.path.append("/Users/robertbrodie/Documents/GitHub/fence-agents/lib")
+from fencing import *
 from fencing import (
     all_opt,
     check_input,
@@ -18,16 +20,33 @@ from fencing import (
     run_delay,
     show_docs,
     fence_action,
+    fail,
     fail_usage,
+    EC_STATUS,
     SyslogLibHandler,
 )
+
+try:
+	import boto3
+	from botocore.exceptions import ConnectionError, ClientError, EndpointConnectionError, NoRegionError
+except ImportError:
+	pass
 
 # Logger configuration
 logger = logging.getLogger()
 logger.propagate = False
 logger.setLevel(logging.INFO)
 logger.addHandler(SyslogLibHandler())
+logging.getLogger('botocore.vendored').propagate = False
 
+status = {
+		"running": "on",
+		"stopped": "off",
+		"pending": "unknown",
+		"stopping": "unknown",
+		"shutting-down": "unknown",
+		"terminated": "unknown"
+}
 
 # Define fencing agent options
 def define_new_opts():
@@ -97,7 +116,26 @@ def define_new_opts():
         "order": 8,
     }
 
-
+def get_power_status(conn, options):
+	logger.debug("Starting status operation")
+	try:
+		instance = conn.instances.filter(Filters=[{"Name": "instance-id", "Values": [options["--plug"]]}])
+		state = list(instance)[0].state["Name"]
+		logger.debug("Status operation for EC2 instance %s returned state: %s",options["--plug"],state.upper())
+		try:
+			return status[state]
+		except KeyError as e:
+			logger.error("Unknown status \"{}\" returned".format(state))
+			return "unknown"
+	except ClientError:
+		fail_usage("Failed: Incorrect Access Key or Secret Key.")
+	except EndpointConnectionError:
+		fail_usage("Failed: Incorrect Region.")
+	except IndexError:
+		fail(EC_STATUS)
+	except Exception as e:
+		logger.error("Failed to get power status: %s", e)
+		fail(EC_STATUS)
 
 # Retrieve instance ID for self-check
 def get_instance_id():
