@@ -1,0 +1,8 @@
+{
+    "python.analysis.extraPaths": [
+        "/Users/robertbrodie/Documents/GitHub/fence-agents/lib"
+    ],
+    "python.autoComplete.extraPaths": [
+        "/Users/robertbrodie/Documents/GitHub/fence-agents/lib"
+    ]
+}
