@@ -1,12 +1,13 @@
 #!/usr/libexec/platform-python -tt
 
-import sys
+import sys, re
 import json
+import atexit
+import logging
+import time
 import boto3
 import requests
 from requests import HTTPError
-import logging
-import time  # Ensure we can call time.sleep
 from requests.exceptions import HTTPError
 from botocore.exceptions import ClientError, EndpointConnectionError, NoRegionError
 
@@ -22,6 +23,7 @@ from fencing import (
     fence_action,
     fail,
     fail_usage,
+    atexit_handler,
     EC_STATUS,
     SyslogLibHandler,
 )
@@ -541,16 +543,39 @@ def shutdown_instance(ec2_client, instance_id):
 
 
 # Perform the fencing action
-def fence_vpc_action(conn, options):
-    """Main fencing logic."""
+def get_nodes_list(conn, options):
+    """Get list of nodes and their status."""
+    logger.debug("Starting monitor operation")
+    result = {}
+    try:
+        if "--filter" in options:
+            filter_key = options["--filter"].split("=")[0].strip()
+            filter_value = options["--filter"].split("=")[1].strip()
+            filter = [{"Name": filter_key, "Values": [filter_value]}]
+            logging.debug("Filter: {}".format(filter))
+
+        for instance in conn.instances.filter(Filters=filter if 'filter' in vars() else []):
+            instance_name = ""
+            for tag in instance.tags or []:
+                if tag.get("Key") == "Name":
+                    instance_name = tag["Value"]
+            try:
+                result[instance.id] = (instance_name, status[instance.state["Name"]])
+            except KeyError as e:
+                if options.get("--original-action") == "list-status":
+                    logger.error("Unknown status \"{}\" returned for {} ({})".format(instance.state["Name"], instance.id, instance_name))
+                result[instance.id] = (instance_name, "unknown")
+    except Exception as e:
+        logger.error("Failed to get node list: %s", e)
+    return result
+
+def set_power_status(conn, options):
+    """Set power status of the instance."""
     ec2_client = conn.meta.client
     instance_id = options["--plug"]
-    # Now that longopt = "sg", the fence library populates options["--sg"].
     sg_to_remove = options.get("--sg", "").split(",") if options.get("--sg") else []
 
     # Perform self-check if skip-race not set
-    #if "--skip-race-check" in options or get_self_power_status(conn,my_instance) == "ok":
-    
     if "--skip-race-check" not in options:
         self_instance_id = get_instance_id()
         if self_instance_id == instance_id:
@@ -561,58 +586,83 @@ def fence_vpc_action(conn, options):
     if instance_state != "running":
         fail_usage(f"Instance {instance_id} is not running. Exiting.")
 
-    # Remove security groups (if provided) and shutdown the instance
-    if (options["--action"]=="off"):
-        if not "--unfence-ignore-restore" in options:
-            restore_security_groups(ec2_client, instance_id)
-        else:
-            print("Ignored Restoring security groups as --unfence-ignore-restore is set")
-    elif (options["--action"]=="on"):
-        if sg_to_remove:
-            if "--invert-sg-removal" not in options:
-                remove_security_groups(ec2_client, instance_id, sg_to_remove)
-                #shutdown_instance(ec2_client, instance_id)
+    try:
+        if options["--action"] == "off":
+            if not "--unfence-ignore-restore" in options:
+                restore_security_groups(ec2_client, instance_id)
             else:
-                keep_only_security_groups(ec2_client, instance_id, sg_to_remove)
-                #shutdown_instance(ec2_client, instance_id)
+                logger.info("Ignored Restoring security groups as --unfence-ignore-restore is set")
+        elif options["--action"] == "on":
+            if sg_to_remove:
+                if "--invert-sg-removal" not in options:
+                    remove_security_groups(ec2_client, instance_id, sg_to_remove)
+                else:
+                    keep_only_security_groups(ec2_client, instance_id, sg_to_remove)
+    except Exception as e:
+        logger.error("Failed to set power status: %s", e)
+        fail(EC_STATUS)
 
-
-
-
-# Main function
 def main():
     device_opt = [
-        "region",
+        "port",
         "no_password",
+        "region",
         "access_key",
         "secret_key",
         "sg",
         "plug",
         "skip_race_check",
         "invert-sg-removal",
-        "unfence-ignore-restore"
+        "unfence-ignore-restore",
+        "filter",
+        "boto3_debug"
     ]
 
-
+    atexit.register(atexit_handler)
     define_new_opts()
 
-    # Parse and validate options
-    print("Defined options:", all_opt)
-
     options = check_input(device_opt, process_input(device_opt))
-    print("Got Here")
     run_delay(options)
 
-    # Show help or metadata if requested
     docs = {
-        "shortdesc": "Fence agent for AWS VPC.",
+        "shortdesc": "Fence agent for AWS VPC",
         "longdesc": (
-            "fence_vpc.py is a fencing agent for managing AWS instances "
-            "by manipulating security groups and instance states."
+            "fence_aws_vpc is a Power Fencing agent for AWS VPC that works by "
+            "manipulating security groups. It uses the boto3 library to connect to AWS.\n\n"
+            "boto3 can be configured with AWS CLI or by creating ~/.aws/credentials.\n"
+            "For instructions see: https://boto3.readthedocs.io/en/latest/guide/quickstart.html#configuration"
         ),
-        "vendorurl": "https://aws.amazon.com",
+        "vendorurl": "http://www.amazon.com"
     }
     show_docs(options, docs)
+
+    # Configure logging
+    if "--debug-file" in options:
+        for handler in logger.handlers:
+            if isinstance(handler, logging.FileHandler):
+                logger.removeHandler(handler)
+        lh = logging.FileHandler(options["--debug-file"])
+        logger.addHandler(lh)
+        lhf = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        lh.setFormatter(lhf)
+        lh.setLevel(logging.DEBUG)
+
+    # Configure boto3 logging
+    if options.get("--boto3_debug", "").lower() not in ["1", "yes", "on", "true"]:
+        boto3.set_stream_logger('boto3', logging.INFO)
+        boto3.set_stream_logger('botocore', logging.CRITICAL)
+        logging.getLogger('botocore').propagate = False
+        logging.getLogger('boto3').propagate = False
+    else:
+        log_format = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
+        logging.getLogger('botocore').propagate = False
+        logging.getLogger('boto3').propagate = False
+        fdh = logging.FileHandler('/var/log/fence_aws_vpc_boto3.log')
+        fdh.setFormatter(log_format)
+        logging.getLogger('boto3').addHandler(fdh)
+        logging.getLogger('botocore').addHandler(fdh)
+        logging.debug("Boto debug level is %s and sending debug info to /var/log/fence_aws_vpc_boto3.log", 
+                     options.get("--boto3_debug"))
 
     # Establish AWS connection
     region = options.get("--region")
@@ -627,11 +677,14 @@ def main():
             aws_secret_access_key=secret_key,
         )
     except Exception as e:
-        fail_usage(f"Failed to connect to AWS: {str(e)}")
+        if not options.get("--action", "") in ["metadata", "manpage", "validate-all"]:
+            fail_usage("Failed: Unable to connect to AWS: " + str(e))
+        else:
+            pass
 
-    # Perform the fencing action
-    fence_vpc_action(conn, options)
-  
+    # Operate the fencing device using the fence library's fence_action
+    result = fence_action(conn, options, set_power_status, get_power_status, get_nodes_list)
+    sys.exit(result)
 
 
 if __name__ == "__main__":
