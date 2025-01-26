@@ -11,8 +11,9 @@ from requests import HTTPError
 from requests.exceptions import HTTPError
 from botocore.exceptions import ClientError, EndpointConnectionError, NoRegionError
 
-#sys.path.append("/usr/share/fence")
-sys.path.append("/Users/robertbrodie/Documents/GitHub/fence-agents/lib")
+sys.path.append("/usr/share/fence")
+#sys.path.append("/Users/robertbrodie/Documents/GitHub/fence-agents/lib")
+
 from fencing import *
 from fencing import (
     all_opt,
@@ -25,7 +26,7 @@ from fencing import (
     fail_usage,
     atexit_handler,
     EC_STATUS,
-    SyslogLibHandler,
+    SyslogLibHandler
 )
 
 try:
@@ -49,86 +50,60 @@ status = {
 		"shutting-down": "unknown",
 		"terminated": "unknown"
 }
-
-# Define fencing agent options
-def define_new_opts():
-    all_opt["region"] = {
-        "getopt": "r:",
-        "longopt": "region",
-        "help": "-r, --region=[region]          AWS region (e.g., us-east-1)",
-        "shortdesc": "AWS Region.",
-        "required": "0",
-        "order": 1,
-    }
-    all_opt["access_key"] = {
-        "getopt": "a:",
-        "longopt": "access-key",
-        "help": "-a, --access-key=[key]         AWS access key.",
-        "shortdesc": "AWS Access Key.",
-        "required": "0",
-        "order": 2,
-    }
-    all_opt["secret_key"] = {
-        "getopt": "s:",
-        "longopt": "secret-key",
-        "help": "-s, --secret-key=[key]         AWS secret key.",
-        "shortdesc": "AWS Secret Key.",
-        "required": "0",
-        "order": 3,
-    }
-    # IMPORTANT: Changed `longopt` to "sg" so that fence library uses options["--sg"].
-    all_opt["sg"] = {
-        "getopt": "g:",
-        "longopt": "sg",
-        "help": "-g, --sg=[sg1,sg2,...]         Comma-separated list of SGs to remove.",
-        "shortdesc": "Security Groups to remove.",
-        "required": "0",
-        "order": 4,
-    }
-    all_opt["plug"] = {
-        "getopt": "n:",
-        "longopt": "plug",
-        "help": "-n, --plug=[id]                Instance ID or target identifier (mandatory).",
-        "shortdesc": "Target instance identifier.",
-        "required": "1",
-        "order": 5,
-    }
-    all_opt["skip_race_check"] = {
-        "getopt": "",
-        "longopt": "skip-race-check",
-        "help": "--skip-race-check              Skip race condition check.",
-        "shortdesc": "Skip race condition check.",
-        "required": "0",
-        "order": 6,
-    }
-    all_opt["invert-sg-removal"] = {
-        "getopt": "",
-        "longopt": "invert-sg-removal",
-        "help": "--invert-sg-removal              Remove all security groups except the specified one.",
-        "shortdesc": "Remove all security groups except specified..",
-        "required": "0",
-        "order": 7,
-    }
-    all_opt["unfence-ignore-restore"] = {
-        "getopt": "",
-        "longopt": "unfence-ignore-restore",
-        "help": "--unfence-ignore-restore              Do not restore security groups from tag when unfencing (off).",
-        "shortdesc": "Remove all security groups except specified..",
-        "required": "0",
-        "order": 8,
-    }
-
 def get_power_status(conn, options):
 	logger.debug("Starting status operation")
 	try:
-		instance = conn.instances.filter(Filters=[{"Name": "instance-id", "Values": [options["--plug"]]}])
-		state = list(instance)[0].state["Name"]
-		logger.debug("Status operation for EC2 instance %s returned state: %s",options["--plug"],state.upper())
-		try:
-			return status[state]
-		except KeyError as e:
-			logger.error("Unknown status \"{}\" returned".format(state))
-			return "unknown"
+		instance_id = options["--plug"]
+		ec2_client = conn.meta.client
+		
+		# Get the lastfence tag first
+		lastfence_response = ec2_client.describe_tags(
+			Filters=[
+				{"Name": "resource-id", "Values": [instance_id]},
+				{"Name": "key", "Values": ["lastfence"]}
+			]
+		)
+		
+		if not lastfence_response["Tags"]:
+			logger.debug("No lastfence tag found for instance %s - instance is not fenced", instance_id)
+			return "on"
+			
+		lastfence_timestamp = lastfence_response["Tags"][0]["Value"]
+		
+		# Check for backup tags with pattern Original_SG_Backup_{instance_id}_*
+		response = ec2_client.describe_tags(
+			Filters=[
+				{"Name": "resource-id", "Values": [instance_id]},
+				{"Name": "key", "Values": [f"Original_SG_Backup_{instance_id}*"]}
+			]
+		)
+		
+		if not response["Tags"]:
+			logger.debug("No backup tags found for instance %s - instance is not fenced", instance_id)
+			return "on"
+			
+		# Loop through backup tags to find matching timestamp
+		for tag in response["Tags"]:
+			try:
+				backup_data = json.loads(tag["Value"])
+				backup_timestamp = backup_data.get("timestamp")
+				
+				if not backup_timestamp:
+					logger.debug("No timestamp found in backup data for tag %s", tag["Key"])
+					continue
+					
+				# Validate timestamps match
+				if str(backup_timestamp) == str(lastfence_timestamp):
+					logger.debug("Found matching backup tag %s - instance is fenced", tag["Key"])
+					return "off"
+					
+			except (json.JSONDecodeError, KeyError) as e:
+				logger.error(f"Failed to parse backup data for tag {tag['Key']}: {str(e)}")
+				continue
+				
+		logger.debug("No backup tags with matching timestamp found - instance is not fenced")
+		return "on"
+			
 	except ClientError:
 		fail_usage("Failed: Incorrect Access Key or Secret Key.")
 	except EndpointConnectionError:
@@ -216,29 +191,53 @@ def get_self_power_status(conn, instance_id):
 	except IndexError:
 		return "fail"
 
-# Create a backup tag
-def create_backup_tag(ec2_client, instance_id, interfaces):
-    """Create a tag on the instance to backup original security groups."""
+# Create backup tags for each network interface
+def create_backup_tag(ec2_client, instance_id, interfaces, timestamp):
+    """Create tags on the instance to backup original security groups for each network interface."""
     try:
-        sg_backup = {"NetworkInterfaces": interfaces}
-        tag_value = json.dumps(sg_backup)
+        # Create a tag for each network interface
+        for idx, interface in enumerate(interfaces, 1):
+            sg_backup = {
+                "NetworkInterface": interface,
+                "timestamp": timestamp
+            }
+            tag_value = json.dumps(sg_backup)
+            tag_key = f"Original_SG_Backup_{instance_id}_{timestamp}_{idx}"
 
-        tag_key = f"Original_SG_Backup_{instance_id}"
-        ec2_client.create_tags(
-            Resources=[instance_id],
-            Tags=[{"Key": tag_key, "Value": tag_value}],
-        )
-        logger.info(f"Backup tag '{tag_key}' created for instance {instance_id}.")
+            # Create the tag
+            ec2_client.create_tags(
+                Resources=[instance_id],
+                Tags=[{"Key": tag_key, "Value": tag_value}],
+            )
+
+            # Verify the tag was created by describing tags
+            response = ec2_client.describe_tags(
+                Filters=[
+                    {"Name": "resource-id", "Values": [instance_id]},
+                    {"Name": "key", "Values": [tag_key]}
+                ]
+            )
+
+            if not response["Tags"]:
+                logger.error(f"Failed to verify creation of backup tag '{tag_key}' for instance {instance_id}")
+                raise Exception("Backup tag creation could not be verified")
+
+            created_tag_value = response["Tags"][0]["Value"]
+            if created_tag_value != tag_value:
+                logger.error(f"Created tag value does not match expected value for instance {instance_id}")
+                raise Exception("Backup tag value mismatch")
+
+            logger.info(f"Backup tag '{tag_key}' created and verified for interface {interface['NetworkInterfaceId']}.")
     except ClientError as e:
-        logger.error(f"AWS API error while creating backup tag: {str(e)}")
+        logger.error(f"AWS API error while creating/verifying backup tag: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"Unexpected error while creating backup tag: {str(e)}")
+        logger.error(f"Unexpected error while creating/verifying backup tag: {str(e)}")
         raise
 
 
 # Remove specified security groups
-def remove_security_groups(ec2_client, instance_id, sg_list):
+def remove_security_groups(ec2_client, instance_id, sg_list, timestamp):
     """
     Removes all SGs in `sg_list` from each interface, if it doesn't leave zero SGs.
     If no changes are made to any interface, we exit with an error.
@@ -247,6 +246,7 @@ def remove_security_groups(ec2_client, instance_id, sg_list):
         ec2_client: The boto3 EC2 client
         instance_id: The ID of the EC2 instance
         sg_list: List of security group IDs to remove
+        timestamp: Unix timestamp for backup tag
         
     Raises:
         ClientError: If AWS API calls fail
@@ -258,7 +258,7 @@ def remove_security_groups(ec2_client, instance_id, sg_list):
         
         try:
             # Create a backup tag before making changes
-            create_backup_tag(ec2_client, instance_id, interfaces)
+            create_backup_tag(ec2_client, instance_id, interfaces, timestamp)
         except ClientError as e:
             logger.warning(f"Failed to create backup tag: {str(e)}")
             # Continue execution even if backup tag creation fails
@@ -320,7 +320,7 @@ def remove_security_groups(ec2_client, instance_id, sg_list):
         logger.error(f"Unexpected error: {str(e)}")
         raise
 
-def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list):
+def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list, timestamp):
     """
     Removes all security groups from each network interface except for the specified ones.
     If none of the specified security groups are attached to an interface, that interface is skipped.
@@ -329,6 +329,7 @@ def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list):
         ec2_client: The boto3 EC2 client
         instance_id: The ID of the EC2 instance
         sg_to_keep_list: List containing the IDs of the security groups to keep
+        timestamp: Unix timestamp for backup tag
         
     Raises:
         ClientError: If AWS API calls fail
@@ -339,7 +340,7 @@ def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list):
 
         try:
             # Create a backup tag before making changes
-            create_backup_tag(ec2_client, instance_id, interfaces)
+            create_backup_tag(ec2_client, instance_id, interfaces, timestamp)
         except ClientError as e:
             logger.warning(f"Failed to create backup tag: {str(e)}")
             # Continue execution even if backup tag creation fails
@@ -406,7 +407,16 @@ def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list):
 
 def restore_security_groups(ec2_client, instance_id):
     """
-    Restores the original security groups from the backup tag to each network interface.
+    Restores the original security groups from backup tags to each network interface.
+    Each network interface's original security groups are stored in a separate backup tag.
+    All backup tags share the same timestamp as the lastfence tag for validation.
+    
+    The process:
+    1. Get lastfence tag timestamp
+    2. Find all backup tags with matching timestamp
+    3. Create a map of interface IDs to their original security groups
+    4. Restore each interface's security groups from the map
+    5. Clean up matching backup tags and lastfence tag
     
     Args:
         ec2_client: The boto3 EC2 client
@@ -415,35 +425,65 @@ def restore_security_groups(ec2_client, instance_id):
     Raises:
         ClientError: If AWS API calls fail
         Exception: For other unexpected errors
+        SystemExit: If required tags are missing or no changes were made
     """
     try:
-        # Get the backup tag
-        response = ec2_client.describe_tags(
+        # Get the lastfence tag first
+        lastfence_response = ec2_client.describe_tags(
             Filters=[
                 {"Name": "resource-id", "Values": [instance_id]},
-                {"Name": "key", "Values": [f"Original_SG_Backup_{instance_id}"]}
+                {"Name": "key", "Values": ["lastfence"]}
             ]
         )
         
-        if not response["Tags"]:
-            logger.error(f"No backup tag found for instance {instance_id}")
+        if not lastfence_response["Tags"]:
+            logger.error(f"No lastfence tag found for instance {instance_id}")
             sys.exit(1)
             
-        try:
-            backup_data = json.loads(response["Tags"][0]["Value"])
-            backup_interfaces = backup_data["NetworkInterfaces"]
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Failed to parse backup data: {str(e)}")
+        lastfence_timestamp = lastfence_response["Tags"][0]["Value"]
+        
+        # Get all backup tags for this instance
+        backup_response = ec2_client.describe_tags(
+            Filters=[
+                {"Name": "resource-id", "Values": [instance_id]},
+                {"Name": "key", "Values": [f"Original_SG_Backup_{instance_id}*"]}
+            ]
+        )
+        
+        if not backup_response["Tags"]:
+            logger.error(f"No backup tags found for instance {instance_id}")
+            sys.exit(1)
+            
+        # Find backup tags with matching timestamp
+        matching_backups = {}
+        for tag in backup_response["Tags"]:
+            try:
+                backup_data = json.loads(tag["Value"])
+                backup_timestamp = backup_data.get("timestamp")
+                
+                if not backup_timestamp:
+                    logger.debug(f"No timestamp found in backup data for tag {tag['Key']}")
+                    continue
+                    
+                if str(backup_timestamp) == str(lastfence_timestamp):
+                    logger.info(f"Found matching backup tag {tag['Key']}")
+                    interface_data = backup_data.get("NetworkInterface")
+                    if interface_data and "NetworkInterfaceId" in interface_data:
+                        matching_backups[interface_data["NetworkInterfaceId"]] = interface_data["SecurityGroups"]
+                    
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error(f"Failed to parse backup data for tag {tag['Key']}: {str(e)}")
+                continue
+                
+        if not matching_backups:
+            logger.error("No backup tags found with matching timestamp")
             sys.exit(1)
             
         # Get current interfaces
         _, _, current_interfaces = get_instance_details(ec2_client, instance_id)
         
-        # Create a map of interface IDs to their backup security groups
-        backup_sg_map = {
-            interface["NetworkInterfaceId"]: interface["SecurityGroups"]
-            for interface in backup_interfaces
-        }
+        # Use the matching_backups map directly as our backup_sg_map
+        backup_sg_map = matching_backups
         
         changed_any = False
         for interface in current_interfaces:
@@ -493,15 +533,28 @@ def restore_security_groups(ec2_client, instance_id):
         # Wait for changes to propagate
         time.sleep(5)
         
-        # Clean up the backup tag
+        # Clean up only the matching backup tags and lastfence tag after successful restore
         try:
-            ec2_client.delete_tags(
-                Resources=[instance_id],
-                Tags=[{"Key": f"Original_SG_Backup_{instance_id}"}]
-            )
-            logger.info(f"Removed backup tag from instance {instance_id}")
+            # Delete all backup tags that match the lastfence timestamp
+            tags_to_delete = [{"Key": "lastfence"}]
+            deleted_tag_keys = []
+            for tag in backup_response["Tags"]:
+                try:
+                    backup_data = json.loads(tag["Value"])
+                    if str(backup_data.get("timestamp")) == str(lastfence_timestamp):
+                        tags_to_delete.append({"Key": tag["Key"]})
+                        deleted_tag_keys.append(tag["Key"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+            if len(tags_to_delete) > 1:  # More than just the lastfence tag
+                ec2_client.delete_tags(
+                    Resources=[instance_id],
+                    Tags=tags_to_delete
+                )
+                logger.info(f"Removed matching backup tags {deleted_tag_keys} and lastfence tag from instance {instance_id}")
         except ClientError as e:
-            logger.warning(f"Failed to remove backup tag: {str(e)}")
+            logger.warning(f"Failed to remove tags: {str(e)}")
             # Continue since the restore operation was successful
             
     except ClientError as e:
@@ -569,11 +622,24 @@ def get_nodes_list(conn, options):
         logger.error("Failed to get node list: %s", e)
     return result
 
+def set_lastfence_tag(ec2_client, instance_id, timestamp):
+    """Set a lastfence tag on the instance with the timestamp."""
+    try:
+        ec2_client.create_tags(
+            Resources=[instance_id],
+            Tags=[{"Key": "lastfence", "Value": str(timestamp)}]
+        )
+        logger.info(f"Set lastfence tag with timestamp {timestamp} on instance {instance_id}")
+    except Exception as e:
+        logger.error(f"Failed to set lastfence tag: {str(e)}")
+        raise
+
 def set_power_status(conn, options):
     """Set power status of the instance."""
+    timestamp = int(time.time())  # Unix timestamp
     ec2_client = conn.meta.client
     instance_id = options["--plug"]
-    sg_to_remove = options.get("--sg", "").split(",") if options.get("--sg") else []
+    sg_to_remove = options.get("--secg", "").split(",") if options.get("--secg") else []
 
     # Perform self-check if skip-race not set
     if "--skip-race-check" not in options:
@@ -587,41 +653,169 @@ def set_power_status(conn, options):
         fail_usage(f"Instance {instance_id} is not running. Exiting.")
 
     try:
-        if options["--action"] == "off":
+        if options["--action"] == "on":
             if not "--unfence-ignore-restore" in options:
                 restore_security_groups(ec2_client, instance_id)
             else:
                 logger.info("Ignored Restoring security groups as --unfence-ignore-restore is set")
-        elif options["--action"] == "on":
+        elif options["--action"] == "off":
             if sg_to_remove:
                 if "--invert-sg-removal" not in options:
-                    remove_security_groups(ec2_client, instance_id, sg_to_remove)
+                    remove_security_groups(ec2_client, instance_id, sg_to_remove, timestamp)
+                    set_lastfence_tag(ec2_client, instance_id, timestamp)
+                    if "--onfence-poweroff" in options:
+                        shutdown_instance(ec2_client, instance_id)
                 else:
-                    keep_only_security_groups(ec2_client, instance_id, sg_to_remove)
+                    keep_only_security_groups(ec2_client, instance_id, sg_to_remove, timestamp)
+                    set_lastfence_tag(ec2_client, instance_id, timestamp)
+                    if "--onfence-poweroff" in options:
+                        shutdown_instance(ec2_client, instance_id)
     except Exception as e:
         logger.error("Failed to set power status: %s", e)
         fail(EC_STATUS)
 
+
+# Define fencing agent options
+def define_new_opts():
+    #print("in define new opts") 
+    
+    all_opt["region"] = {
+        "getopt": "r:",
+        "longopt": "region",
+        "help": "-r, --region=[region]          AWS region (e.g., us-east-1)",
+        "shortdesc": "AWS Region.",
+        "required": "0",
+        "order": 1,
+    }
+    all_opt["access_key"] = {
+        "getopt": "a:",
+        "longopt": "access-key",
+        "help": "-a, --access-key=[key]         AWS access key.",
+        "shortdesc": "AWS Access Key.",
+        "required": "0",
+        "order": 2,
+    }
+    all_opt["secret_key"] = {
+        "getopt": "s:",
+        "longopt": "secret-key",
+        "help": "-s, --secret-key=[key]         AWS secret key.",
+        "shortdesc": "AWS Secret Key.",
+        "required": "0",
+        "order": 3,
+    }
+    all_opt["secg"] = {
+        "getopt": "g:",
+        "longopt": "secg",
+        "help": "-g --secg=[sg1,sg2,...]         Comma-separated list of Security Groups to remove.",
+        "shortdesc": "Security Groups to remove.",
+        "required": "0",
+        "order": 4,
+    }
+    all_opt["plug"] = {
+        "getopt": "n:",
+        "longopt": "plug",
+        "help": "-n, --plug=[id]                Instance ID or target identifier (mandatory).",
+        "shortdesc": "Target instance identifier.",
+        "required": "1",
+        "order": 5,
+    }
+    all_opt["skip_race_check"] = {
+        "getopt": "",
+        "longopt": "skip-race-check",
+        "help": "--skip-race-check              Skip race condition check.",
+        "shortdesc": "Skip race condition check.",
+        "required": "0",
+        "order": 6,
+    }
+    all_opt["invert-sg-removal"] = {
+        "getopt": "",
+        "longopt": "invert-sg-removal",
+        "help": "--invert-sg-removal              Remove all security groups except the specified one.",
+        "shortdesc": "Remove all security groups except specified..",
+        "required": "0",
+        "order": 7,
+    }
+    all_opt["unfence-ignore-restore"] = {
+        "getopt": "",
+        "longopt": "unfence-ignore-restore",
+        "help": "--unfence-ignore-restore              Do not restore security groups from tag when unfencing (off).",
+        "shortdesc": "Remove all security groups except specified..",
+        "required": "0",
+        "order": 8,
+        
+    }
+    all_opt["filter"] = {
+        "getopt": ":",
+        "longopt": "filter",
+        "help": "--filter=[key=value]           Filter (e.g. vpc-id=[vpc-XXYYZZAA])",
+        "shortdesc": "Filter for list-action",
+        "required": "0",
+        "order": 9
+    }
+    all_opt["boto3_debug"] = {
+        "getopt": "b:",
+        "longopt": "boto3_debug",
+        "help": "-b, --boto3_debug=[option]     Boto3 and Botocore library debug logging",
+        "shortdesc": "Boto Lib debug",
+        "required": "0",
+        "default": "False",
+        "order": 10
+    }    
+    all_opt["onfence-poweroff"] = {
+        "getopt": "",
+        "longopt": "onfence-poweroff",
+        "help": "--onfence-poweroff              Power off the machine async upon fence (this is a network fencing agent...)",
+        "shortdesc": "Power off the machine async..",
+        "required": "0",
+        "order": 11
+    }
+
+
+
+
+
 def main():
+    conn = None
+    print("in main")    
+
     device_opt = [
-        "port",
-        "no_password",
+        "no_password", 
         "region",
-        "access_key",
+        "access_key", 
         "secret_key",
-        "sg",
+        "secg",
         "plug",
         "skip_race_check",
         "invert-sg-removal",
         "unfence-ignore-restore",
         "filter",
-        "boto3_debug"
-    ]
+        "boto3_debug",
+        "onfence-poweroff"
+]
+
+    #device_opt = ["port", "no_password" "filter", "boto3_debug","region", "access_key", "secret_key", "skip_race_check"]
+    #device_opt = ["port", "no_password", "region", "access_key", "secret_key", "boto3_debug", "skip_race_check"]
+ 
+
 
     atexit.register(atexit_handler)
+    print("after atexit")
+    
     define_new_opts()
 
-    options = check_input(device_opt, process_input(device_opt))
+    print("after define new opts") 
+
+    try:
+        print("before check input")
+        processed_input = process_input(device_opt)
+        print("Processed input:", processed_input)
+        options = check_input(device_opt, processed_input)
+        print("after check input")
+    except Exception as e:
+        logger.error(f"Failed to process input options: {str(e)}")
+        print(f"Error details: {str(e)}")
+        sys.exit(1)
+
     run_delay(options)
 
     docs = {
@@ -635,6 +829,7 @@ def main():
         "vendorurl": "http://www.amazon.com"
     }
     show_docs(options, docs)
+
 
     # Configure logging
     if "--debug-file" in options:
@@ -683,6 +878,7 @@ def main():
             pass
 
     # Operate the fencing device using the fence library's fence_action
+    print("before fence action")
     result = fence_action(conn, options, set_power_status, get_power_status, get_nodes_list)
     sys.exit(result)
 
