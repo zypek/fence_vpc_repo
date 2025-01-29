@@ -270,15 +270,15 @@ def remove_security_groups(ec2_client, instance_id, sg_list, timestamp):
                 # Exclude any SGs that are in sg_list
                 updated_sgs = [sg for sg in original_sgs if sg not in sg_list]
 
-                # If there's no change or we'd end up with zero SGs, skip
-                if updated_sgs == original_sgs:
-                    continue
+                # Only skip if we'd end up with zero SGs
                 if not updated_sgs:
                     logger.info(
                         f"Skipping interface {interface['NetworkInterfaceId']}: "
                         f"removal of {sg_list} would leave 0 SGs."
                     )
                     continue
+                
+                # Proceed even if there's no change (idempotency)
 
                 logger.info(
                     f"Updating interface {interface['NetworkInterfaceId']} from {original_sgs} "
@@ -350,17 +350,9 @@ def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list, timestam
             try:
                 original_sgs = interface["SecurityGroups"]
                 
-                # Check if any of the security groups to keep are attached
-                sgs_to_keep = [sg for sg in original_sgs if sg in sg_to_keep_list]
-                if not sgs_to_keep:
-                    logger.info(
-                        f"Skipping interface {interface['NetworkInterfaceId']}: "
-                        f"none of the security groups {sg_to_keep_list} are attached."
-                    )
-                    continue
-
-                # Set interface to only use the specified security groups
-                updated_sgs = sgs_to_keep
+                # Set interface to only use the specified security groups that exist
+                # This allows the function to work even if some SGs aren't currently attached
+                updated_sgs = sg_to_keep_list
                 
                 if updated_sgs == original_sgs:
                     continue
