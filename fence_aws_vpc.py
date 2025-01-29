@@ -768,7 +768,7 @@ def define_new_opts():
 
 def main():
     conn = None
-    print("in main")    
+    #print("in main")    
 
     device_opt = [
         "no_password", 
@@ -791,21 +791,21 @@ def main():
 
 
     atexit.register(atexit_handler)
-    print("after atexit")
+    #print("after atexit")
     
     define_new_opts()
 
-    print("after define new opts") 
+    #print("after define new opts") 
 
     try:
-        print("before check input")
+        #print("before check input")
         processed_input = process_input(device_opt)
-        print("Processed input:", processed_input)
+        #print("Processed input:", processed_input)
         options = check_input(device_opt, processed_input)
-        print("after check input")
+        #print("after check input")
     except Exception as e:
         logger.error(f"Failed to process input options: {str(e)}")
-        print(f"Error details: {str(e)}")
+        #print(f"Error details: {str(e)}")
         sys.exit(1)
 
     run_delay(options)
@@ -870,7 +870,7 @@ def main():
             pass
 
     # Operate the fencing device using the fence library's fence_action
-    print("before fence action")
+    #print("before fence action")
     result = fence_action(conn, options, set_power_status, get_power_status, get_nodes_list)
     sys.exit(result)
 
