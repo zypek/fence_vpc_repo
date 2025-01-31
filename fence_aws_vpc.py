@@ -42,14 +42,6 @@ logger.setLevel(logging.INFO)
 logger.addHandler(SyslogLibHandler())
 logging.getLogger('botocore.vendored').propagate = False
 
-def debug_verbose(message, level=1):
-    """Helper function to log debug messages based on verbose level"""
-    if "--verbose-level" in options:
-        if int(options["--verbose-level"]) >= level:
-            logger.debug(message)
-    elif level == 1:
-        logger.debug(message)
-
 status = {
 		"running": "on",
 		"stopped": "off",
