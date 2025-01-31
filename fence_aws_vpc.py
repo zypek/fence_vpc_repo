@@ -51,7 +51,7 @@ status = {
 		"terminated": "unknown"
 }
 def get_power_status(conn, options):
-	debug_verbose("Starting status operation", 1)
+	logger.debug("Starting status operation")
 	try:
 		instance_id = options["--plug"]
 		ec2_client = conn.meta.client
@@ -65,7 +65,7 @@ def get_power_status(conn, options):
 		)
 		
 		if not lastfence_response["Tags"]:
-			debug_verbose(f"No lastfence tag found for instance {instance_id} - instance is not fenced", 2)
+			logger.debug("No lastfence tag found for instance %s - instance is not fenced", instance_id)
 			return "on"
 			
 		lastfence_timestamp = lastfence_response["Tags"][0]["Value"]
@@ -79,7 +79,7 @@ def get_power_status(conn, options):
 		)
 		
 		if not response["Tags"]:
-			debug_verbose(f"No backup tags found for instance {instance_id} - instance is not fenced", 2)
+			logger.debug("No backup tags found for instance %s - instance is not fenced", instance_id)
 			return "on"
 			
 		# Loop through backup tags to find matching timestamp
@@ -89,19 +89,19 @@ def get_power_status(conn, options):
 				backup_timestamp = backup_data.get("timestamp")
 				
 				if not backup_timestamp:
-					debug_verbose(f"No timestamp found in backup data for tag {tag['Key']}", 2)
+					logger.debug("No timestamp found in backup data for tag %s", tag["Key"])
 					continue
 					
 				# Validate timestamps match
 				if str(backup_timestamp) == str(lastfence_timestamp):
-					debug_verbose(f"Found matching backup tag {tag['Key']} - instance is fenced", 2)
+					logger.debug("Found matching backup tag %s - instance is fenced", tag["Key"])
 					return "off"
 					
 			except (json.JSONDecodeError, KeyError) as e:
 				logger.error(f"Failed to parse backup data for tag {tag['Key']}: {str(e)}")
 				continue
 				
-		debug_verbose("No backup tags with matching timestamp found - instance is not fenced", 2)
+		logger.debug("No backup tags with matching timestamp found - instance is not fenced")
 		return "on"
 			
 	except ClientError:
@@ -178,10 +178,10 @@ def get_self_power_status(conn, instance_id):
 		instance = conn.instances.filter(Filters=[{"Name": "instance-id", "Values": [instance_id]}])
 		state = list(instance)[0].state["Name"]
 		if state == "running":
-			debug_verbose(f"Captured my ({instance_id}) state and it {state.upper()} - returning OK - Proceeding with fencing", 2)
+			logger.debug("Captured my (%s) state and it %s - returning OK - Proceeding with fencing",instance_id,state.upper())
 			return "ok"
 		else:
-			debug_verbose(f"Captured my ({instance_id}) state it is {state.upper()} - returning Alert - Unable to fence other nodes", 2)
+			logger.debug("Captured my (%s) state it is %s - returning Alert - Unable to fence other nodes",instance_id,state.upper())
 			return "alert"
 	
 	except ClientError:
@@ -189,7 +189,7 @@ def get_self_power_status(conn, instance_id):
 	except EndpointConnectionError:
 		fail_usage("Failed: Incorrect Region.")
 	except IndexError:
-		fail(EC_STATUS, "Failed to get instance state")
+		return "fail"
 
 # Create backup tags for each network interface
 def create_backup_tag(ec2_client, instance_id, interfaces, timestamp):
@@ -220,12 +220,12 @@ def create_backup_tag(ec2_client, instance_id, interfaces, timestamp):
 
             if not response["Tags"]:
                 logger.error(f"Failed to verify creation of backup tag '{tag_key}' for instance {instance_id}")
-                fail(EC_STATUS)
+                raise Exception("Backup tag creation could not be verified")
 
             created_tag_value = response["Tags"][0]["Value"]
             if created_tag_value != tag_value:
                 logger.error(f"Created tag value does not match expected value for instance {instance_id}")
-                fail(EC_STATUS)
+                raise Exception("Backup tag value mismatch")
 
             logger.info(f"Backup tag '{tag_key}' created and verified for interface {interface['NetworkInterfaceId']}.")
     except ClientError as e:
@@ -308,7 +308,7 @@ def remove_security_groups(ec2_client, instance_id, sg_list, timestamp):
                 f"Security Groups {sg_list} not removed from any interface. "
                 f"Either not found, or removal left 0 SGs."
             )
-            fail(EC_STATUS)
+            sys.exit(1)
 
         # Wait a bit for changes to propagate
         time.sleep(5)
@@ -385,7 +385,7 @@ def keep_only_security_groups(ec2_client, instance_id, sg_to_keep_list, timestam
                 f"Security Groups {sg_to_keep_list} not found on any interface. "
                 f"No changes made."
             )
-            fail(EC_STATUS)
+            sys.exit(1)
 
         # Wait a bit for changes to propagate
         time.sleep(5)
@@ -430,7 +430,7 @@ def restore_security_groups(ec2_client, instance_id):
         
         if not lastfence_response["Tags"]:
             logger.error(f"No lastfence tag found for instance {instance_id}")
-            fail(EC_STATUS)
+            sys.exit(1)
             
         lastfence_timestamp = lastfence_response["Tags"][0]["Value"]
         
@@ -444,7 +444,7 @@ def restore_security_groups(ec2_client, instance_id):
         
         if not backup_response["Tags"]:
             logger.error(f"No backup tags found for instance {instance_id}")
-            fail(EC_STATUS)
+            sys.exit(1)
             
         # Find backup tags with matching timestamp
         matching_backups = {}
@@ -469,7 +469,7 @@ def restore_security_groups(ec2_client, instance_id):
                 
         if not matching_backups:
             logger.error("No backup tags found with matching timestamp")
-            fail(EC_STATUS)
+            sys.exit(1)
             
         # Get current interfaces
         _, _, current_interfaces = get_instance_details(ec2_client, instance_id)
@@ -520,7 +520,7 @@ def restore_security_groups(ec2_client, instance_id):
                 
         if not changed_any:
             logger.error("No security groups were restored. All interfaces skipped.")
-            fail(EC_STATUS)
+            sys.exit(1)
             
         # Wait for changes to propagate
         time.sleep(5)
@@ -590,14 +590,14 @@ def shutdown_instance(ec2_client, instance_id):
 # Perform the fencing action
 def get_nodes_list(conn, options):
     """Get list of nodes and their status."""
-    debug_verbose("Starting monitor operation", 1)
+    logger.debug("Starting monitor operation")
     result = {}
     try:
         if "--filter" in options:
             filter_key = options["--filter"].split("=")[0].strip()
             filter_value = options["--filter"].split("=")[1].strip()
             filter = [{"Name": filter_key, "Values": [filter_value]}]
-            debug_verbose(f"Filter: {filter}", 2)
+            logging.debug("Filter: {}".format(filter))
 
         for instance in conn.instances.filter(Filters=filter if 'filter' in vars() else []):
             instance_name = ""
@@ -611,7 +611,7 @@ def get_nodes_list(conn, options):
                     logger.error("Unknown status \"{}\" returned for {} ({})".format(instance.state["Name"], instance.id, instance_name))
                 result[instance.id] = (instance_name, "unknown")
     except Exception as e:
-        fail(EC_STATUS, f"Failed to get node list: {e}")
+        logger.error("Failed to get node list: %s", e)
     return result
 
 def set_lastfence_tag(ec2_client, instance_id, timestamp):
@@ -623,7 +623,8 @@ def set_lastfence_tag(ec2_client, instance_id, timestamp):
         )
         logger.info(f"Set lastfence tag with timestamp {timestamp} on instance {instance_id}")
     except Exception as e:
-        fail(EC_STATUS, f"Failed to set lastfence tag: {str(e)}")
+        logger.error(f"Failed to set lastfence tag: {str(e)}")
+        raise
 
 def set_power_status(conn, options):
     """Set power status of the instance."""
@@ -662,7 +663,8 @@ def set_power_status(conn, options):
                     if "--onfence-poweroff" in options:
                         shutdown_instance(ec2_client, instance_id)
     except Exception as e:
-        fail(EC_STATUS, f"Failed to set power status: {e}")
+        logger.error("Failed to set power status: %s", e)
+        fail(EC_STATUS)
 
 
 # Define fencing agent options
@@ -802,7 +804,9 @@ def main():
         options = check_input(device_opt, processed_input)
         #print("after check input")
     except Exception as e:
-        fail(EC_STATUS, f"Failed to process input options: {str(e)}")
+        logger.error(f"Failed to process input options: {str(e)}")
+        #print(f"Error details: {str(e)}")
+        sys.exit(1)
 
     run_delay(options)
 
