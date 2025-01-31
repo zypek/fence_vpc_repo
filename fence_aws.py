@@ -2,8 +2,10 @@
 import sys, re
 import logging
 import atexit
+
 #sys.path.append("@FENCEAGENTSLIBDIR@")
 sys.path.append("/usr/share/fence")
+
 from fencing import *
 from fencing import fail, fail_usage, run_delay, EC_STATUS, SyslogLibHandler
 
